@@ -59,6 +59,9 @@ def create_invoke_handler(
     position_label: str,
     fallback_fn: Callable[[dict, int, int], list[dict]],
     fallback_cfg: FallbackConfig,
+    fast_path_fn: Callable[[dict, int, int, str], list[dict] | None] | None = None,
+    context_fn: Callable[[dict, int, int, str], str] | None = None,
+    stateless: bool = False,
 ):
     """Create and register the @app.entrypoint invoke handler.
 
@@ -66,6 +69,14 @@ def create_invoke_handler(
       1. LLM response → parse into commands
       2. fallback_fn(game_state, team_id, my_player_id) → rule-based commands
       3. last-resort command from fallback_cfg → single safe command
+
+    Optional:
+      - fast_path_fn: returns commands for clear-cut situations before the LLM
+        is called, or None to defer to it.
+      - context_fn: extra text appended to the state summary sent to the LLM.
+      - stateless: clear the agent's conversation history every tick. A Strands
+        Agent keeps every previous tick in agent.messages, so without this the
+        prompt grows all match long and responses get steadily slower.
     """
     log = app.logger
     last_resort = build_last_resort(fallback_cfg, my_player_id)
@@ -83,11 +94,22 @@ def create_invoke_handler(
             my_players = prompt_data.get("myPlayers", [my_player_id])
             effective_pid = my_players[0] if my_players else my_player_id
 
+            if fast_path_fn is not None:
+                commands = fast_path_fn(game_state, team_id, effective_pid, position_label)
+                if commands:
+                    log.info(f"{position_label} fast path: {[c.get('commandType') for c in commands]}")
+                    yield json.dumps(commands)
+                    return
+
             state_summary = summarize_state(
                 game_state, team_id, effective_pid, position_label
             )
+            if context_fn is not None:
+                state_summary += "\n\n" + context_fn(game_state, team_id, effective_pid, position_label)
             log.info(f"{position_label} agent invoked for team {team_id}, controlling player {effective_pid}")
 
+            if stateless:
+                agent.messages.clear()
             response = agent(state_summary)
             response_text = str(response)
 
